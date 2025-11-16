@@ -3,6 +3,7 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/param.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -12,6 +13,9 @@
 #define BACK  5
 
 #define MAXARGS 10
+
+// Track background jobs
+int jobs[NPROC];
 
 struct cmd {
   int type;
@@ -53,6 +57,21 @@ int fork1(void);  // Fork but panics on failure.
 void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
+
+// Poll for completed background jobs
+void
+reap_background_jobs(void)
+{
+  int status;
+  int pid;
+  while ((pid = wait_noblock(&status)) > 0) {
+    // Check if this was a background job
+    if (jobs[pid % NPROC] == pid) {
+      printf("[bg %d] exited with status %d\n", pid, status);
+      jobs[pid % NPROC] = 0;
+    }
+  }
+}
 
 // Execute cmd.  Never returns.
 void
@@ -124,8 +143,9 @@ runcmd(struct cmd *cmd)
 
   case BACK:
     bcmd = (struct backcmd*)cmd;
-    if(fork1() == 0)
-      runcmd(bcmd->cmd);
+    // Don't fork again - we're already in a child process
+    // Just execute the command directly
+    runcmd(bcmd->cmd);
     break;
   }
   exit(0);
@@ -142,11 +162,50 @@ getcmd(char *buf, int nbuf)
   return 0;
 }
 
+// Read a line from file descriptor
 int
-main(void)
+getline_fd(char *buf, int nbuf, int fd)
+{
+  int i, cc;
+  char c;
+
+  for(i = 0; i < nbuf - 1; i++){
+    cc = read(fd, &c, 1);
+    if(cc < 1)
+      break;
+    buf[i] = c;
+    if(c == '\n' || c == '\r')
+      break;
+  }
+  buf[i] = '\0';
+  
+  if(i == 0)
+    return -1;
+  return 0;
+}
+
+int
+main(int argc, char* argv[])
 {
   static char buf[100];
   int fd;
+  int pid;
+  struct cmd *cmd;
+  int script_fd = -1;
+
+  // Initialize jobs array
+  for(int i = 0; i < NPROC; i++) {
+    jobs[i] = 0;
+  }
+  
+  // Check if running a script file
+  if(argc > 1) {
+    script_fd = open(argv[1], O_RDONLY);
+    if(script_fd < 0) {
+      fprintf(2, "sh: cannot open %s\n", argv[1]);
+      exit(1);
+    }
+  }
 
   // Ensure that three file descriptors are open.
   while((fd = open("console", O_RDWR)) >= 0){
@@ -157,7 +216,21 @@ main(void)
   }
 
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
+  while(1) {
+    // Reap background jobs before printing prompt
+    reap_background_jobs();
+    
+    // Read command from script file or interactive input
+    int ret;
+    if(script_fd >= 0) {
+      ret = getline_fd(buf, sizeof(buf), script_fd);
+    } else {
+      ret = getcmd(buf, sizeof(buf));
+    }
+    
+    if(ret < 0)
+      break;
+      
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
       // Chdir must be called by the parent, not the child.
       buf[strlen(buf)-1] = 0;  // chop \n
@@ -165,10 +238,52 @@ main(void)
         fprintf(2, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
+    
+    if(buf[0] == 'j' && buf[1] == 'o' && buf[2] == 'b' && buf[3] == 's' && 
+       (buf[4] == '\n' || buf[4] == 0)){
+      // jobs command: print all running background jobs
+      for(int i = 0; i < NPROC; i++) {
+        if(jobs[i] != 0) {
+          printf("%d\n", jobs[i]);
+        }
+      }
+      continue;
+    }
+
+    cmd = parsecmd(buf);
+    
+    // Check if this is a background command
+    int is_background = (cmd->type == BACK);
+    
+    pid = fork1();
+    if(pid == 0) {
+      runcmd(cmd);
+    }
+    
+    if(is_background) {
+      // Background job: print PID and track it
+      printf("[%d]\n", pid);
+      jobs[pid % NPROC] = pid;
+      // Give the background job a moment to start/fail
+      sleep(1);
+    } else {
+      // Foreground job: wait for it
+      int status;
+      int wpid;
+      // Keep waiting until we get our foreground process
+      while((wpid = wait(&status)) != pid && wpid != -1) {
+        // If we reaped a background job while waiting, print it
+        if(jobs[wpid % NPROC] == wpid) {
+          printf("[bg %d] exited with status %d\n", wpid, status);
+          jobs[wpid % NPROC] = 0;
+        }
+      }
+    }
   }
+  
+  if(script_fd >= 0)
+    close(script_fd);
+    
   exit(0);
 }
 
